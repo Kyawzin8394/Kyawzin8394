@@ -280,7 +280,8 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
         'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcxMDQtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
     }
     try:
-        async with session_obj.get(url, headers=headers, allow_redirects=True) as req:
+        sid_timeout = aiohttp.ClientTimeout(total=10)
+        async with session_obj.get(url, headers=headers, allow_redirects=True, timeout=sid_timeout) as req:
             response = str(req.url)
             sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", response)
             return sid.group(1) if sid else previous_session_id
@@ -1230,16 +1231,27 @@ async def start_polling():
     backoff = 5
     while True:
         try:
-            await bot.infinity_polling(timeout=20, request_timeout=20)
-            return
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"Polling error: {e}. Reconnecting in {backoff}s...")
+            await bot.infinity_polling(
+                timeout=30,
+                request_timeout=60,
+                long_polling_timeout=25,
+                allowed_updates=None,
+                restart_on_change=False
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as e:
+            print(f"Polling timeout (normal): {e}. Retry in {backoff}s...")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 1.5, 30)
         except Exception as e:
-            print(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            err = str(e).lower()
+            if "timeout" in err or "timed out" in err or "request timeout" in err:
+                print(f"Polling timeout: retrying in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 1.5, 30)
+            else:
+                print(f"Polling error: {e}. Retry in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
 async def main():
     global session, _connector
