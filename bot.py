@@ -1228,27 +1228,17 @@ async def listkeys(message):
 
 # ── Polling and main ──────────────────────────────────────────────────────
 async def start_polling():
-    backoff = 5
     while True:
         try:
             await bot.infinity_polling(
                 timeout=30,
-                request_timeout=60
+                request_timeout=60,
+                non_stop=True,
+                interval=1
             )
-        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as e:
-            print(f"Polling timeout (normal): {e}. Retry in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.5, 30)
         except Exception as e:
-            err = str(e).lower()
-            if "timeout" in err or "timed out" in err or "request timeout" in err:
-                print(f"Polling timeout: retrying in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, 30)
-            else:
-                print(f"Polling error: {e}. Retry in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+            print(f"Polling crashed: {e}. Restarting in 5s...")
+            await asyncio.sleep(5)
 
 async def main():
     global session, _connector
