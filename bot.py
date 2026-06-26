@@ -17,6 +17,14 @@ try:
 except ImportError:
     DDDDOCR_AVAILABLE = False
 
+try:
+    from PIL import Image
+    import pytesseract
+    import io
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+
 # ── Environment variables ─────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -211,18 +219,36 @@ def format_progress(checked, total=None, speed=0, found=0, target=None):
 _ocr = ddddocr.DdddOcr(show_ad=False) if DDDDOCR_AVAILABLE else None
 
 def _ocr_sync(image_bytes):
-    if not CV2_AVAILABLE or not DDDDOCR_AVAILABLE or _ocr is None:
-        return None
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, buffer = cv2.imencode('.png', thresh)
-    result = _ocr.classification(buffer.tobytes())
-    return result.upper()
+    # Method 1: ddddocr + cv2 (best accuracy)
+    if CV2_AVAILABLE and DDDDOCR_AVAILABLE and _ocr is not None:
+        try:
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is not None:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                blur = cv2.GaussianBlur(gray, (3, 3), 0)
+                _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                _, buffer = cv2.imencode('.png', thresh)
+                result = _ocr.classification(buffer.tobytes())
+                return result.upper()
+        except Exception:
+            pass
+
+    # Method 2: pytesseract (Termux fallback)
+    if TESSERACT_AVAILABLE:
+        try:
+            img = Image.open(io.BytesIO(image_bytes)).convert('L')
+            img = img.point(lambda x: 0 if x < 128 else 255)
+            text = pytesseract.image_to_string(
+                img,
+                config='--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            ).strip()
+            text = re.sub(r'[^A-Z0-9]', '', text.upper())
+            return text if text else None
+        except Exception:
+            pass
+
+    return None
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
