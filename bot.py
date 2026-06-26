@@ -1233,10 +1233,7 @@ async def start_polling():
         try:
             await bot.infinity_polling(
                 timeout=30,
-                request_timeout=60,
-                long_polling_timeout=25,
-                allowed_updates=None,
-                restart_on_change=False
+                request_timeout=60
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as e:
             print(f"Polling timeout (normal): {e}. Retry in {backoff}s...")
